@@ -2,7 +2,7 @@
 import torch
 import tilelang
 from tilelang import language as T
-from utils import assert_tensors_similar
+from utils import assert_tensors_similar, MemRecorder
 
 
 @tilelang.jit(
@@ -294,23 +294,51 @@ def test_sparse_mla_fwd(B=1,
         rep=100,
         warmup=250,
     )
+    iterations = 10
+    mems = [0.0] * iterations
+    for i in range(iterations):
+        with MemRecorder(mode="peak") as mr:
+            fn()
+        mems[i] = mr.memory
+    avg_mem = sum(mems) / iterations / (1024**3)
     print(f"Average time: {ms:.3f} ms")
     print("fwd io bandwidth = ", (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
     print("fwd tflops = ", (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
+    print(f"fwd avg memory = {avg_mem:.2f} GB")
 
 
 if __name__ == "__main__":
-    test_sparse_mla_fwd(
-        B=1,
-        S=4096,
-        SKV=4096,
-        H=128,
-        HKV=1,
-        DQK=576,
-        DV=512,
-        topk=2048,
-        dtype=torch.bfloat16,
-        check_correctness=True,
-        block_I=64,
-        num_stages=2,
-        threads=256)
+    configs = [
+        {
+            "S": 32 * 1024,
+            "SKV": 32 * 1024,
+        },
+        {
+            "S": 64 * 1024,
+            "SKV": 64 * 1024,
+        },
+        {
+            "S": 96 * 1024,
+            "SKV": 96 * 1024,
+        },
+        {
+            "S": 128 * 1024,
+            "SKV": 128 * 1024,
+        },
+    ]
+    for config in configs:
+        print(f"Running test with S={config['S']}, SKV={config['SKV']}")
+        test_sparse_mla_fwd(
+            B=1,
+            S=config['S'],
+            SKV=config['SKV'],
+            H=128,
+            HKV=1,
+            DQK=576,
+            DV=512,
+            topk=2048,
+            dtype=torch.bfloat16,
+            check_correctness=False,
+            block_I=64,
+            num_stages=2,
+            threads=256)

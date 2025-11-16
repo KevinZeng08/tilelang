@@ -13,6 +13,8 @@ import triton.language as tl
 from fla.ops.utils import prepare_token_indices
 from fla.utils import autocast_custom_fwd, contiguous
 
+from reference import MemRecorder
+
 
 @triton.heuristics({
     'USE_OFFSETS': lambda args: args['offsets'] is not None,
@@ -533,8 +535,8 @@ def tilelang_sparse_attention(batch,
                     T.copy(K[i_b, i_s:i_s + BS, i_h, :], K_shared)
 
                     if is_causal:
-                        for i, j in T.Parallel(G, BS):
-                            acc_s[i, j] = T.if_then_else(i_t >= (i_s + j), 0,
+                        for k, j in T.Parallel(G, BS):
+                            acc_s[k, j] = T.if_then_else(i_t >= (i_s + j), 0,
                                                          -T.infinity(acc_s.dtype))
                     else:
                         T.clear(acc_s)
@@ -550,18 +552,18 @@ def tilelang_sparse_attention(batch,
                     T.copy(scores_max, scores_max_prev)
                     T.fill(scores_max, -T.infinity(accum_dtype))
                     T.reduce_max(acc_s, scores_max, dim=1, clear=True)
-                    for i in T.Parallel(G):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                    for i, j in T.Parallel(G, BS):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    for k in T.Parallel(G):
+                        scores_scale[k] = T.exp2(scores_max_prev[k] * scale - scores_max[k] * scale)
+                    for k, j in T.Parallel(G, BS):
+                        acc_s[k, j] = T.exp2(acc_s[k, j] * scale - scores_max[k] * scale)
                     T.reduce_sum(acc_s, scores_sum, dim=1)
-                    for i in T.Parallel(G):
-                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                    for k in T.Parallel(G):
+                        logsum[k] = logsum[k] * scores_scale[k] + scores_sum[k]
                     T.copy(acc_s, acc_s_cast)
 
                     # Rescale
-                    for i, j in T.Parallel(G, BV):
-                        acc_o[i, j] *= scores_scale[i]
+                    for k, j in T.Parallel(G, BV):
+                        acc_o[k, j] *= scores_scale[k]
 
                     # V * softmax(Q * K)
                     T.copy(V[i_b, i_s:i_s + BS, i_h, i_v * BV:(i_v + 1) * BV], V_shared)
@@ -645,11 +647,15 @@ def benchmark_nsa(batch_size,
     torch.cuda.synchronize()
 
     # Benchmark
+    mems = [0.0] * iterations
     start_time = time.time()
-    for _ in range(iterations):
-        kernel(Q, K, V, block_indices, out)
+    for i in range(iterations):
+        with MemRecorder(mode="peak") as mr:
+            kernel(Q, K, V, block_indices, out)
+        mems[i] = mr.memory
     torch.cuda.synchronize()
     end_time = time.time()
+    avg_memory = sum(mems) / iterations / (1024**3)  # GB
 
     # Calculate metrics
     elapsed_time = end_time - start_time
@@ -700,7 +706,8 @@ def benchmark_nsa(batch_size,
         "head_query": head_query,
         "dim": dim,
         "selected_blocks": selected_blocks,
-        "block_size": block_size
+        "block_size": block_size,
+        "avg_memory_gb": avg_memory,
     }
 
 
@@ -757,22 +764,26 @@ def benchmark_triton_nsa(batch_size,
 
     # Benchmark
     start_time = time.time()
-    for _ in range(iterations):
-        out = parallel_nsa_fwd(
-            q=Q,
-            k=K,
-            v=V,
-            o_slc=o_slc,
-            o_swa=None,
-            lse_slc=lse_slc,
-            lse_swa=None,
-            block_indices=block_indices,
-            block_counts=block_counts,
-            block_size=block_size,
-            window_size=0,
-            scale=scale)
+    mems = [0.0] * iterations
+    for i in range(iterations):
+        with MemRecorder(mode="peak") as mr:
+            out = parallel_nsa_fwd(
+                q=Q,
+                k=K,
+                v=V,
+                o_slc=o_slc,
+                o_swa=None,
+                lse_slc=lse_slc,
+                lse_swa=None,
+                block_indices=block_indices,
+                block_counts=block_counts,
+                block_size=block_size,
+                window_size=0,
+                scale=scale)
+        mems[i] = mr.memory
     torch.cuda.synchronize()
     end_time = time.time()
+    avg_memory = sum(mems) / iterations / (1024**3)  # GB
 
     # Calculate metrics
     elapsed_time = end_time - start_time
@@ -815,7 +826,8 @@ def benchmark_triton_nsa(batch_size,
         "head_query": head_query,
         "dim": dim,
         "selected_blocks": selected_blocks,
-        "block_size": block_size
+        "block_size": block_size,
+        "avg_memory_gb": avg_memory,
     }
 
 
@@ -878,6 +890,7 @@ def run_benchmark_suite(impl='all'):
             results.append({"impl": "tilelang", **result})
             print(f"Average time: {result['avg_time_ms']:.2f} ms")
             print(f"Performance: {result['tflops']:.2f} TFLOPs")
+            print(f"Memory Usage: {result['avg_memory_gb']:.2f} GB")
 
         if impl in ['all', 'triton']:
             print("Benchmarking Triton implementation:")
@@ -895,6 +908,7 @@ def run_benchmark_suite(impl='all'):
             results.append({"impl": "triton", **result})
             print(f"Average time: {result['avg_time_ms']:.2f} ms")
             print(f"Performance: {result['tflops']:.2f} TFLOPs")
+            print(f"Memory Usage: {result['avg_memory_gb']:.2f} GB")
 
         if impl in ['all']:
             # Print comparison if both implementations were run
@@ -971,6 +985,7 @@ if __name__ == "__main__":
                 f"block_size={args.block_size}")
             print(f"Average time: {result['avg_time_ms']:.2f} ms")
             print(f"Performance: {result['tflops']:.2f} TFLOPs")
+            print(f"Memory Usage: {result['avg_memory_gb']:.2f} GB")
 
         if args.impl in ["triton", "all"]:
             print("Benchmarking Triton implementation:")
@@ -994,3 +1009,4 @@ if __name__ == "__main__":
                 f"block_size={args.block_size}")
             print(f"Average time: {result['avg_time_ms']:.2f} ms")
             print(f"Performance: {result['tflops']:.2f} TFLOPs")
+            print(f"Memory Usage: {result['avg_memory_gb']:.2f} GB")

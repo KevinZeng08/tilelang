@@ -2,8 +2,50 @@
 from typing import Optional
 
 import torch
+from contextlib import contextmanager
 from typing import Union
 from einops import rearrange, repeat
+from py3nvml import py3nvml
+
+
+@contextmanager
+def nvml_context():
+    py3nvml.nvmlInit()
+    yield
+    py3nvml.nvmlShutdown()
+
+
+class MemRecorder:
+
+    def __init__(self, mode="allocated", device_idx=0) -> None:
+        self.memory = None
+        self.mode = mode
+        self.device_idx = device_idx
+
+    def get_alloc_memory_from_torch(self):
+        return torch.cuda.memory_allocated()
+
+    @nvml_context()
+    def get_alloc_memory_from_nvml(self):
+        handle = py3nvml.nvmlDeviceGetHandleByIndex(self.device_idx)
+        meminfo = py3nvml.nvmlDeviceGetMemoryInfo(handle)
+        return meminfo.used
+
+    def __enter__(self):
+        if self.mode == "peak":
+            torch.cuda.reset_peak_memory_stats()
+        elif self.mode == "allocated":
+            # self.memory = self.get_alloc_memory_from_torch()
+            self.memory = self.get_alloc_memory_from_nvml()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.mode == "peak":
+            self.memory = torch.cuda.max_memory_allocated()
+        elif self.mode == "allocated":
+            # self.memory = self.get_alloc_memory_from_torch() - self.memory
+            # self.memory = self.get_alloc_memory_from_nvml() - self.memory
+            self.memory = self.get_alloc_memory_from_nvml()
 
 
 def naive_nsa(q: torch.Tensor,

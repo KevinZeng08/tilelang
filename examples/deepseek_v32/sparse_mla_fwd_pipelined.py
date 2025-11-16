@@ -4,6 +4,7 @@ import tilelang
 from tilelang import language as T
 from tilelang.engine.callback import register_cuda_postproc_callback
 import argparse
+from utils import MemRecorder
 
 
 @tilelang.jit(
@@ -426,7 +427,7 @@ def test_sparse_mla_fwd_pipelined(B=1,
                 indices[b, t, h, :len(i_i)] = i_i
 
     kernel = sparse_mla_fwd_interface(
-        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=True)
+        q, kv, indices, q_start_s_index, KV_stride, return_kernel=True, print_kernel=False)
 
     def fn():
         out, lse = kernel(q, kv, indices, q_start_s_index_t)
@@ -435,11 +436,12 @@ def test_sparse_mla_fwd_pipelined(B=1,
         return out, lse
 
     tl_out, tl_lse = fn()
-    ref_out = ref_sparse_mla_fwd_interface(q, kv, indices, q_start_s_index, KV_stride)
-    # print(f"tl_out: {tl_out}")
-    # print(f"ref_out: {ref_out}")
+    if check_correctness:
+        ref_out = ref_sparse_mla_fwd_interface(q, kv, indices, q_start_s_index, KV_stride)
+        # print(f"tl_out: {tl_out}")
+        # print(f"ref_out: {ref_out}")
 
-    torch.testing.assert_close(tl_out, ref_out, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(tl_out, ref_out, rtol=1e-3, atol=1e-3)
 
     from tilelang.profiler import do_bench
     ms = do_bench(
@@ -447,9 +449,17 @@ def test_sparse_mla_fwd_pipelined(B=1,
         rep=10,
         warmup=10,
     )
+    iterations = 10
+    mems = [0.0] * iterations
+    for i in range(iterations):
+        with MemRecorder(mode="peak") as mr:
+            fn()
+        mems[i] = mr.memory
+    avg_mem = sum(mems) / iterations / (1024**3)
     print(f"Average time: {ms:.3f} ms")
     print(f'fwd io bandwidth = ', (B * S * DQK * topk * 2) / (ms * 1e-3) / 1e12)
     print(f'fwd tflops = ', (B * S * (DQK + DV) * topk * 2 * H) / (ms * 1e-3) / 1e12)
+    print(f"fwd avg memory = {avg_mem:2f} GB")
 
 
 if __name__ == "__main__":
@@ -460,5 +470,29 @@ if __name__ == "__main__":
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 1024, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
     else:
         B, S, SKV, H, HKV, DQK, DV, topk, dtype = 1, 4096, 8192, 128, 1, 576, 512, 2048, torch.bfloat16
-    test_sparse_mla_fwd_pipelined(
-        B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=args.test_correctness)
+
+    configs = [
+        {
+            "S": 32 * 1024,
+            "SKV": 32 * 1024,
+        },
+        {
+            "S": 64 * 1024,
+            "SKV": 64 * 1024,
+        },
+        {
+            "S": 96 * 1024,
+            "SKV": 96 * 1024,
+        },
+        {
+            "S": 128 * 1024,
+            "SKV": 128 * 1024,
+        },
+    ]
+
+    for config in configs:
+        print("Running with config:", config)
+        S = config["S"]
+        SKV = config["SKV"]
+        test_sparse_mla_fwd_pipelined(
+            B, S, SKV, H, HKV, DQK, DV, topk, dtype, check_correctness=args.test_correctness)

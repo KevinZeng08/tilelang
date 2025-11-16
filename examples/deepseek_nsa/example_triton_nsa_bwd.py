@@ -908,9 +908,16 @@ if __name__ == "__main__":
         block_size=block_size,
         block_counts=block_counts,
     )
-    print("tri", tri)
-    print("ref", ref)
+    # print("tri", tri)
+    # print("ref", ref)
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     tri.backward(do)
+    end_event.record()
+    torch.cuda.synchronize()
+    print(f"Parallel NSA backward time: {start_event.elapsed_time(end_event)} ms")
     tri_dq, q.grad = q.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dv, v.grad = v.grad.clone(), None

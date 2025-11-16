@@ -155,9 +155,12 @@ def tilelang_kernel_fwd(
     return native_sparse_attention
 
 
-@tilelang.jit(pass_configs={
-    tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-})
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    })
 def tilelang_kernel_bwd_dkv(
     batch,
     heads,
@@ -321,9 +324,12 @@ def make_dq_layout(dQ):
     )
 
 
-@tilelang.jit(pass_configs={
-    tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-})
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    })
 def tilelang_kernel_bwd_dqkv(
     batch,
     heads,
@@ -348,6 +354,7 @@ def tilelang_kernel_bwd_dqkv(
 
     B = batch
     BS = block_size
+    H = heads // groups
     G = groups
     V = dim
     K = dim
@@ -487,8 +494,11 @@ def tilelang_kernel_bwd_dqkv(
 
 
 @tilelang.jit(
-    out_idx=[2], pass_configs={
+    out_idx=[2],
+    pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     })
 def tilelang_kernel_preprocess(
     batch,
@@ -527,8 +537,11 @@ def tilelang_kernel_preprocess(
 
 
 @tilelang.jit(
-    out_idx=[2], pass_configs={
+    out_idx=[2],
+    pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     })
 def tilelang_kernel_block_mask(
     batch,
@@ -547,7 +560,7 @@ def tilelang_kernel_block_mask(
     NS = tilelang.cdiv(seq_len, BS)
 
     block_mask_shape = [batch, seq_len, heads, NS]
-    USE_BLOCK_COUNTS = block_counts is not None
+    USE_BLOCK_COUNTS = True
 
     @T.prim_func
     def flash_bwd_block_mask(
@@ -845,7 +858,14 @@ if __name__ == "__main__":
         block_size=block_size,
         block_counts=block_counts,
     )
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     tri.backward(do)
+    end_event.record()
+    torch.cuda.synchronize()
+    print(f"Parallel NSA backward time: {start_event.elapsed_time(end_event)} ms")
     tri_dq, q.grad = q.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dv, v.grad = v.grad.clone(), None

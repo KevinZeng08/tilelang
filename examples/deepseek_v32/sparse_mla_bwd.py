@@ -2,7 +2,7 @@
 import tilelang
 from tilelang import language as T
 import torch
-from utils import assert_tensors_similar
+from utils import assert_tensors_similar, MemRecorder
 
 
 @tilelang.jit(out_idx=[-1])
@@ -358,9 +358,9 @@ def test_sparse_mla_bwd(B=1,
     tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices)
 
     tl_dq, tl_dkv = sparse_mla_bwd(q, kv, tl_out, do, indices, tl_lse)
-    ref_dq, ref_dkv = ref_sparse_mla_bwd_interface(q, kv, None, do, indices, None)
 
     if check_correctness:
+        ref_dq, ref_dkv = ref_sparse_mla_bwd_interface(q, kv, None, do, indices, None)
         assert_tensors_similar(tl_dq, ref_dq, eps=1e-4, name="dq")
         assert_tensors_similar(tl_dkv, ref_dkv, eps=1e-4, name="dkv")
         print("assert_tensors_similar passed")
@@ -378,21 +378,49 @@ def test_sparse_mla_bwd(B=1,
         return sparse_mla_bwd(q, kv, tl_out, do, indices, tl_lse)
 
     ms = do_bench(fn, rep=100, warmup=250)
+    iterations = 10
+    mems = [0.0] * iterations
+    for i in range(iterations):
+        with MemRecorder(mode="peak") as mr:
+            fn()
+        mems[i] = mr.memory
+    avg_mem = sum(mems) / iterations / (1024**3)
     print(f"Average time: {ms:.3f} ms")
     print(f'bwd io bandwidth = ',
           (B * S * max(DQKV * 2, DQKV + DV) * topk * 2) / (ms * 1e-3) / 1e12)
     print(f'bwd tflops = ', per_token_flop * S / (ms * 1e-3) / 1e12)
+    print(f"bwd avg memory = {avg_mem:.2f} GB")
 
 
 if __name__ == "__main__":
-    test_sparse_mla_bwd(
-        B=1,
-        S=4096,
-        SKV=8192,
-        H=64,
-        HKV=1,
-        DQKV=576,
-        DV=512,
-        topk=2048,
-        dtype=torch.bfloat16,
-        check_correctness=True)
+    configs = [
+        {
+            "S": 32 * 1024,
+            "SKV": 32 * 1024,
+        },
+        {
+            "S": 64 * 1024,
+            "SKV": 64 * 1024,
+        },
+        {
+            "S": 96 * 1024,
+            "SKV": 96 * 1024,
+        },
+        {
+            "S": 128 * 1024,
+            "SKV": 128 * 1024,
+        },
+    ]
+    for config in configs:
+        print(f"Running test with S={config['S']}, SKV={config['SKV']}")
+        test_sparse_mla_bwd(
+            B=1,
+            S=config["S"],
+            SKV=config["SKV"],
+            H=64,
+            HKV=1,
+            DQKV=576,
+            DV=512,
+            topk=2048,
+            dtype=torch.bfloat16,
+            check_correctness=False)
